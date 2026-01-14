@@ -1,0 +1,121 @@
+import numpy as np
+import pandas as pd
+from catboost import CatBoostRegressor, Pool
+
+# -----------------------------
+# File paths (adjust if needed)
+# -----------------------------
+TRAIN_X_PATH = "train_hh_features.csv"
+TRAIN_Y_PATH = "train_hh_gt.csv"
+TEST_X_PATH  = "test_hh_features.csv"
+RATES_GT_PATH = "train_rates_gt.csv"
+
+OUT_PATH = "submission_rates.csv"
+
+# -----------------------------
+# Load data
+# -----------------------------
+train_x = pd.read_csv(TRAIN_X_PATH)
+train_y = pd.read_csv(TRAIN_Y_PATH)
+test_x  = pd.read_csv(TEST_X_PATH)
+rates_gt = pd.read_csv(RATES_GT_PATH)
+
+# Merge training labels
+train = train_x.merge(train_y, on=["survey_id", "hhid"], how="inner")
+assert len(train) == len(train_x), "Train merge mismatch—check keys."
+
+# Threshold columns (the exact output schema required)
+threshold_cols = [c for c in rates_gt.columns if c != "survey_id"]
+threshold_vals = [float(c.split("_")[-1]) for c in threshold_cols]
+
+# -----------------------------
+# Features/target
+# -----------------------------
+# Drop pure identifiers (keep weight + strata etc.)
+DROP_COLS = ["hhid", "com"]
+
+y = train["cons_ppp17"].astype(float).values
+y_log = np.log1p(y)  # stabilise heavy-tailed consumption
+
+X = train.drop(columns=DROP_COLS + ["cons_ppp17"])
+X_test = test_x.drop(columns=DROP_COLS)
+
+# Keep survey_id in the dataframe for later aggregation, but *do not* train on it.
+# (Test survey_ids are unseen; using it as a categorical feature often hurts.)
+survey_train = X["survey_id"].values
+survey_test  = X_test["survey_id"].values
+
+X = X.drop(columns=["survey_id"])
+X_test_model = X_test.drop(columns=["survey_id"])
+
+# Identify categorical columns: objects + low-cardinality numeric codes
+obj_cols = X.select_dtypes(include="object").columns.tolist()
+low_card_num = [c for c in X.columns if c not in obj_cols and X[c].nunique(dropna=True) <= 50]
+cat_cols = sorted(set(obj_cols + low_card_num))
+
+# CatBoost requires categorical values be non-NaN (strings are safest)
+def prep_catboost(df, cat_cols):
+    df = df.copy()
+    for c in cat_cols:
+        df[c] = df[c].astype("object")
+        df[c] = df[c].where(~df[c].isna(), "Missing").astype(str)
+    return df
+
+X_cb = prep_catboost(X, cat_cols)
+X_test_cb = prep_catboost(X_test_model, cat_cols)
+
+# -----------------------------
+# Train model
+# -----------------------------
+train_pool = Pool(X_cb, y_log, cat_features=cat_cols)
+
+model = CatBoostRegressor(
+    loss_function="RMSE",
+    iterations=2500,
+    learning_rate=0.05,
+    depth=8,
+    l2_leaf_reg=6,
+    random_seed=42,
+    verbose=200
+)
+
+model.fit(train_pool)
+
+# -----------------------------
+# Predict test consumption
+# -----------------------------
+pred_log = model.predict(X_test_cb)
+pred = np.expm1(pred_log)
+
+# Safety: consumption shouldn't go negative
+pred = np.clip(pred, 0, None)
+
+# -----------------------------
+# Convert to survey-level poverty rates (weighted)
+# -----------------------------
+test_rates_rows = []
+tmp = pd.DataFrame({
+    "survey_id": survey_test,
+    "weight": test_x["weight"].astype(float).values,
+    "pred_cons": pred
+})
+
+for sid, grp in tmp.groupby("survey_id"):
+    w = grp["weight"].values
+    ws = w.sum()
+    row = {"survey_id": int(sid)}
+    p = grp["pred_cons"].values
+
+    for col, thr in zip(threshold_cols, threshold_vals):
+        row[col] = float((w * (p < thr)).sum() / ws)
+
+    test_rates_rows.append(row)
+
+submission = pd.DataFrame(test_rates_rows).sort_values("survey_id")
+
+# Ensure column order matches ground-truth template
+submission = submission[["survey_id"] + threshold_cols]
+
+submission.to_csv(OUT_PATH, index=False)
+print(f"Saved: {OUT_PATH}")
+print(submission)
