@@ -1,121 +1,169 @@
 import numpy as np
 import pandas as pd
+import zipfile
 from catboost import CatBoostRegressor, Pool
 
 # -----------------------------
-# File paths (adjust if needed)
+# Paths
 # -----------------------------
 TRAIN_X_PATH = "train_hh_features.csv"
 TRAIN_Y_PATH = "train_hh_gt.csv"
 TEST_X_PATH  = "test_hh_features.csv"
 RATES_GT_PATH = "train_rates_gt.csv"
 
-OUT_PATH = "submission_rates.csv"
+OUT_ZIP = "submission.zip"
+OUT_HH  = "predicted_household_consumption.csv"
+OUT_POV = "predicted_poverty_distribution.csv"
 
 # -----------------------------
-# Load data
+# Options (tuneable)
+# -----------------------------
+USE_SAMPLE_WEIGHTS = True
+ADD_WITHIN_SURVEY_FEATURES = True
+
+CATBOOST_PARAMS = dict(
+    iterations=4000,
+    learning_rate=0.03,
+    depth=8,
+    l2_leaf_reg=6,
+    subsample=0.8,
+    rsm=0.8,
+    loss_function="RMSE",
+    random_seed=42,
+    od_type="Iter",
+    od_wait=200,
+    verbose=200
+)
+
+# -----------------------------
+# Load
 # -----------------------------
 train_x = pd.read_csv(TRAIN_X_PATH)
 train_y = pd.read_csv(TRAIN_Y_PATH)
 test_x  = pd.read_csv(TEST_X_PATH)
 rates_gt = pd.read_csv(RATES_GT_PATH)
 
-# Merge training labels
 train = train_x.merge(train_y, on=["survey_id", "hhid"], how="inner")
 assert len(train) == len(train_x), "Train merge mismatch—check keys."
 
-# Threshold columns (the exact output schema required)
 threshold_cols = [c for c in rates_gt.columns if c != "survey_id"]
-threshold_vals = [float(c.split("_")[-1]) for c in threshold_cols]
+thr_vals = [float(c.split("_")[-1]) for c in threshold_cols]
 
 # -----------------------------
-# Features/target
+# Feature engineering (within-survey)
 # -----------------------------
-# Drop pure identifiers (keep weight + strata etc.)
-DROP_COLS = ["hhid", "com"]
-
-y = train["cons_ppp17"].astype(float).values
-y_log = np.log1p(y)  # stabilise heavy-tailed consumption
-
-X = train.drop(columns=DROP_COLS + ["cons_ppp17"])
-X_test = test_x.drop(columns=DROP_COLS)
-
-# Keep survey_id in the dataframe for later aggregation, but *do not* train on it.
-# (Test survey_ids are unseen; using it as a categorical feature often hurts.)
-survey_train = X["survey_id"].values
-survey_test  = X_test["survey_id"].values
-
-X = X.drop(columns=["survey_id"])
-X_test_model = X_test.drop(columns=["survey_id"])
-
-# Identify categorical columns: objects + low-cardinality numeric codes
-obj_cols = X.select_dtypes(include="object").columns.tolist()
-low_card_num = [c for c in X.columns if c not in obj_cols and X[c].nunique(dropna=True) <= 50]
-cat_cols = sorted(set(obj_cols + low_card_num))
-
-# CatBoost requires categorical values be non-NaN (strings are safest)
-def prep_catboost(df, cat_cols):
+def add_within_survey_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+    survey_col = "survey_id"
+
+    # For categoricals: within-survey frequency encoding
+    # For numerics: within-survey percentile rank
+    # (Uses only households within the same survey — allowed.)
+    obj_cols = df.select_dtypes(include="object").columns.tolist()
+    cat_cols = sorted(set(obj_cols + ["strata"])) if "strata" in df.columns else obj_cols
+
+    # Frequency for categorical columns
     for c in cat_cols:
-        df[c] = df[c].astype("object")
         df[c] = df[c].where(~df[c].isna(), "Missing").astype(str)
+        df[f"{c}__freq"] = df.groupby(survey_col)[c].transform(
+            lambda s: s.map(s.value_counts(normalize=True))
+        ).astype(float)
+
+    # Percentiles for numeric columns (exclude identifiers)
+    id_like = {"hhid", "com", "survey_id"}
+    num_cols = [c for c in df.columns if c not in id_like and df[c].dtype != "object"]
+    for c in num_cols:
+        if df[c].nunique(dropna=True) > 2:
+            df[f"{c}__pct"] = df.groupby(survey_col)[c].rank(pct=True, method="average")
+
     return df
 
-X_cb = prep_catboost(X, cat_cols)
-X_test_cb = prep_catboost(X_test_model, cat_cols)
+# -----------------------------
+# Prepare matrices
+# -----------------------------
+def prep(df: pd.DataFrame, is_train: bool):
+    df = df.copy()
+    # Drop constant column if present
+    if "com" in df.columns:
+        df = df.drop(columns=["com"])
+
+    if ADD_WITHIN_SURVEY_FEATURES:
+        df = add_within_survey_features(df)
+
+    y = None
+    if is_train:
+        y = np.log1p(df["cons_ppp17"].astype(float).values)
+
+    # CatBoost cat columns: anything object + strata
+    obj_cols = df.select_dtypes(include="object").columns.tolist()
+    cat_cols = sorted(set(obj_cols + (["strata"] if "strata" in df.columns else [])))
+
+    for c in cat_cols:
+        df[c] = df[c].where(~df[c].isna(), "Missing").astype(str)
+
+    feat_cols = [c for c in df.columns if c not in ["hhid", "survey_id", "cons_ppp17"]]
+    cat_feats = [c for c in cat_cols if c in feat_cols]
+
+    X = df[feat_cols]
+    return df, X, y, cat_feats, feat_cols
+
+train_df, X_tr, y_tr, cat_feats, feat_cols = prep(train, is_train=True)
+test_df,  X_te, _,   _,        _         = prep(test_x, is_train=False)
+
+w_tr = train_df["weight"].astype(float).values if USE_SAMPLE_WEIGHTS else None
 
 # -----------------------------
-# Train model
+# Fit
 # -----------------------------
-train_pool = Pool(X_cb, y_log, cat_features=cat_cols)
-
-model = CatBoostRegressor(
-    loss_function="RMSE",
-    iterations=2500,
-    learning_rate=0.05,
-    depth=8,
-    l2_leaf_reg=6,
-    random_seed=42,
-    verbose=200
-)
-
-model.fit(train_pool)
+model = CatBoostRegressor(**CATBOOST_PARAMS)
+model.fit(Pool(X_tr, y_tr, cat_features=cat_feats, weight=w_tr))
 
 # -----------------------------
-# Predict test consumption
+# Predict household consumption
 # -----------------------------
-pred_log = model.predict(X_test_cb)
-pred = np.expm1(pred_log)
+pred_log = model.predict(X_te)
+pred_cons = np.expm1(pred_log)
+pred_cons = np.clip(pred_cons, 0, None)
 
-# Safety: consumption shouldn't go negative
-pred = np.clip(pred, 0, None)
-
-# -----------------------------
-# Convert to survey-level poverty rates (weighted)
-# -----------------------------
-test_rates_rows = []
-tmp = pd.DataFrame({
-    "survey_id": survey_test,
-    "weight": test_x["weight"].astype(float).values,
-    "pred_cons": pred
+hh_out = pd.DataFrame({
+    "survey_id": test_df["survey_id"].astype(int).values,
+    "household_id": test_df["hhid"].astype(int).values,
+    "per_capita_household_consumption": pred_cons.astype(float)
 })
 
-for sid, grp in tmp.groupby("survey_id"):
-    w = grp["weight"].values
+# -----------------------------
+# Compute poverty distribution from predicted consumption
+# -----------------------------
+tmp = pd.DataFrame({
+    "survey_id": test_df["survey_id"].astype(int).values,
+    "weight": test_df["weight"].astype(float).values,
+    "pred_cons": pred_cons.astype(float)
+})
+
+rows = []
+for sid, g in tmp.groupby("survey_id"):
+    w = g["weight"].values
     ws = w.sum()
+    p = g["pred_cons"].values
     row = {"survey_id": int(sid)}
-    p = grp["pred_cons"].values
-
-    for col, thr in zip(threshold_cols, threshold_vals):
+    for col, thr in zip(threshold_cols, thr_vals):
+        # Strictly less than threshold
         row[col] = float((w * (p < thr)).sum() / ws)
+    rows.append(row)
 
-    test_rates_rows.append(row)
+pov_out = pd.DataFrame(rows).sort_values("survey_id")
+pov_out = pov_out[["survey_id"] + threshold_cols]
 
-submission = pd.DataFrame(test_rates_rows).sort_values("survey_id")
+# -----------------------------
+# Write CSVs + ZIP at root level
+# -----------------------------
+hh_out.to_csv(OUT_HH, index=False)
+pov_out.to_csv(OUT_POV, index=False)
 
-# Ensure column order matches ground-truth template
-submission = submission[["survey_id"] + threshold_cols]
+with zipfile.ZipFile(OUT_ZIP, "w", compression=zipfile.ZIP_DEFLATED) as z:
+    z.write(OUT_HH)
+    z.write(OUT_POV)
 
-submission.to_csv(OUT_PATH, index=False)
-print(f"Saved: {OUT_PATH}")
-print(submission)
+print(f"Wrote {OUT_ZIP} containing {OUT_HH} and {OUT_POV}")
+print(hh_out.head())
+print(pov_out)
